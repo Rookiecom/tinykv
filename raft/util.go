@@ -127,3 +127,12 @@ func IsResponseMsg(msgt pb.MessageType) bool {
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
+
+func tranEntries(entries []pb.Entry) []*pb.Entry {
+	res := make([]*pb.Entry, 0)
+	for i, _ := range entries {
+		entry := entries[i]
+		res = append(res, &entry)
+	}
+	return res
+}

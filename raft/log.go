@@ -53,6 +53,9 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	// firstIndex is the index of the first entry in entries include dummy entry
+	// also mean snapshot log length
+	firstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -74,10 +77,12 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
-	l.entries = entries
+	l.entries = append([]pb.Entry{{Index: firstIndex - 1}}, entries...)
 	l.committed = firstIndex - 1
 	l.applied = firstIndex - 1
 	l.stabled = lastIndex
+
+	l.firstIndex = firstIndex - 1
 
 	return l
 }
@@ -94,39 +99,34 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries
+	return l.entries[1:]
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled:]
+	unstableIndex := l.stabled + 1
+	return l.entries[unstableIndex-l.firstIndex:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.applied-l.firstIndex+1 : l.committed-l.firstIndex+1]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		lastIndex, _ := l.storage.LastIndex()
-		return lastIndex
-	}
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
+}
 
-	return uint64(len(l.entries) - 1)
+func (l *RaftLog) FirstIndex() uint64 {
+	return l.entries[0].Index + 1
 }
 
 func (l *RaftLog) lastTerm() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		lastIndex, _ := l.storage.LastIndex()
-		term, _ := l.Term(lastIndex)
-		return term
-	}
 	term, err := l.Term(l.LastIndex())
 	if err != nil {
 		panic(err)
@@ -150,6 +150,10 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	var term uint64
 	var err error
+	if i < l.firstIndex {
+		return 0, errors.New("index less than start index")
+	}
+	i -= l.firstIndex
 	if i < 0 || i >= uint64(len(l.entries)) {
 		err = errors.New("index out of range")
 	} else {
@@ -164,9 +168,90 @@ func (l *RaftLog) appendEntries(entries ...*pb.Entry) {
 	}
 }
 
-func (l *RaftLog) commitTo(toCommit uint64) {
+func (l *RaftLog) commitTo(toCommit uint64) bool {
 	// Your Code Here (2A).
-	if l.committed < toCommit {
+	if l.committed < toCommit && toCommit <= l.LastIndex() {
 		l.committed = toCommit
+		return true
+	}
+	return false
+}
+
+// Entries return [start, end)
+func (l *RaftLog) Entries(start, end uint64) ([]pb.Entry, error) {
+	// Your Code Here (2A).
+	if start > end {
+		return nil, errors.New("start index greater than end index")
+	}
+	if start == end {
+		return nil, nil
+	}
+
+	if start < l.firstIndex {
+		return nil, errors.New("start index less than 0")
+	}
+	if end > l.LastIndex()+1 {
+		return nil, errors.New("end index greater than last index")
+	}
+	return l.entries[start-l.firstIndex : end-l.firstIndex], nil
+}
+
+func (l *RaftLog) truncateEntries(index uint64) {
+	if index < l.firstIndex {
+		l.entries = nil
+		return
+	}
+	if index < l.LastIndex() {
+		l.entries = l.entries[:index+1]
+		if l.stabled > index {
+			l.stabled = index
+		}
+	}
+}
+
+func (l *RaftLog) findConflict(entries []*pb.Entry) uint64 {
+	for _, entry := range entries {
+		if l.LastIndex() < entry.Index || l.entries[entry.Index].Term != entry.Term {
+			return entry.Index
+		}
+	}
+	return 0
+}
+
+func (l *RaftLog) findConflictByTerm(start uint64, term int64) (conflictIndex, conflictTerm uint64) {
+	for i := start; i >= 0; i-- {
+		if ourTerm, err := l.Term(i); err != nil {
+			return i, 0
+		} else if ourTerm != uint64(term) {
+			return i, ourTerm
+		}
+	}
+	return 0, 0
+}
+
+// append entries to the log, manage the stable and unstable entries
+func (l *RaftLog) append(entries ...*pb.Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	firstIndex := entries[0].Index
+	if firstIndex > l.stabled {
+		if firstIndex < l.LastIndex()+1 {
+			l.truncateEntries(firstIndex - 1)
+		}
+		l.appendEntries(entries...)
+		return
+	}
+	l.truncateEntries(l.stabled)
+	conflictIndex := l.findConflict(entries)
+	if conflictIndex == 0 {
+		l.truncateEntries(l.stabled)
+		if (l.stabled - firstIndex + 1) < uint64(len(entries)) {
+			l.appendEntries(entries[l.stabled-firstIndex+1:]...)
+		}
+	} else {
+		l.stabled = conflictIndex - 1
+		l.truncateEntries(conflictIndex - 1)
+		l.appendEntries(entries[conflictIndex-firstIndex:]...)
 	}
 }
