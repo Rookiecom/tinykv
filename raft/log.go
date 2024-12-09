@@ -102,6 +102,10 @@ func (l *RaftLog) allEntries() []pb.Entry {
 	return l.entries[1:]
 }
 
+func (l *RaftLog) hasUnstableEntries() bool {
+	return l.stabled < l.LastIndex()
+}
+
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
@@ -175,6 +179,16 @@ func (l *RaftLog) commitTo(toCommit uint64) bool {
 		return true
 	}
 	return false
+}
+
+func (l *RaftLog) applyTo(toApply uint64) {
+	if toApply > l.applied {
+		l.applied = toApply
+	}
+}
+
+func (l *RaftLog) stableTo(toStable uint64) {
+	l.stabled = toStable
 }
 
 // Entries return [start, end)
@@ -254,4 +268,19 @@ func (l *RaftLog) append(entries ...*pb.Entry) {
 		l.truncateEntries(conflictIndex - 1)
 		l.appendEntries(entries[conflictIndex-firstIndex:]...)
 	}
+}
+
+func (l *RaftLog) hastNextCommittedEntries() bool {
+	start := l.applied + 1
+	end := min(l.committed, l.stabled) + 1
+	return start < end
+}
+
+func (l *RaftLog) nextCommittedEntries() []pb.Entry {
+	start := l.applied + 1
+	end := min(l.committed, l.stabled) + 1
+	if start >= end {
+		return []pb.Entry{}
+	}
+	return l.entries[start:end]
 }
