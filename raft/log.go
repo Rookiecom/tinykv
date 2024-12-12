@@ -278,7 +278,7 @@ func (l *RaftLog) hastNextCommittedEntries() bool {
 
 func (l *RaftLog) nextCommittedEntries() []pb.Entry {
 	start := l.applied + 1
-	end := min(l.committed, l.stabled) + 1
+	end := l.committed + 1
 	if start >= end {
 		return []pb.Entry{}
 	}

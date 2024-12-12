@@ -73,6 +73,13 @@ type Ready struct {
 	Messages []pb.Message
 }
 
+func (r *Ready) LastCommittedIndex() uint64 {
+	if len(r.CommittedEntries) > 0 {
+		return r.CommittedEntries[len(r.CommittedEntries)-1].Index
+	}
+	return 0
+}
+
 // RawNode is a wrapper of Raft.
 type RawNode struct {
 	Raft *Raft
@@ -166,12 +173,8 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(rn.prevHardSt, rn.Raft.hardState()) {
 		rd.HardState = rn.Raft.hardState()
 	}
-	if rd.Entries = rn.Raft.RaftLog.unstableEntries(); len(rd.Entries) > 0 {
-		rn.Raft.RaftLog.stableTo(rd.Entries[len(rd.Entries)-1].Index)
-	}
-	if rd.CommittedEntries = rn.Raft.RaftLog.nextCommittedEntries(); len(rd.CommittedEntries) > 0 {
-		rn.Raft.RaftLog.applyTo(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
-	}
+	rd.Entries = rn.Raft.RaftLog.unstableEntries()
+	rd.CommittedEntries = rn.Raft.RaftLog.nextCommittedEntries()
 	return rd
 }
 
@@ -204,11 +207,13 @@ func (rn *RawNode) Advance(rd Ready) {
 	if !isHardStateEqual(rd.HardState, pb.HardState{}) {
 		rn.prevHardSt = rd.HardState
 	}
-	for _, m := range rd.Messages {
-		if m.To == rn.Raft.id {
-			rn.Raft.Step(m)
-		}
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stableTo(rd.Entries[len(rd.Entries)-1].Index)
 	}
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applyTo(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
+	}
+	rn.Raft.msgs = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this
