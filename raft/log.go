@@ -129,6 +129,10 @@ func (l *RaftLog) FirstIndex() uint64 {
 	return l.entries[0].Index + 1
 }
 
+func (l *RaftLog) relativeIndex(index uint64) uint64 {
+	return index - l.firstIndex
+}
+
 func (l *RaftLog) lastTerm() uint64 {
 	// Your Code Here (2A).
 	term, err := l.Term(l.LastIndex())
@@ -173,7 +177,6 @@ func (l *RaftLog) appendEntries(entries ...*pb.Entry) {
 }
 
 func (l *RaftLog) commitTo(toCommit uint64) bool {
-	// Your Code Here (2A).
 	if l.committed < toCommit && toCommit <= l.LastIndex() {
 		l.committed = toCommit
 		return true
@@ -188,6 +191,9 @@ func (l *RaftLog) applyTo(toApply uint64) {
 }
 
 func (l *RaftLog) stableTo(toStable uint64) {
+	if toStable <= l.stabled {
+		return
+	}
 	l.stabled = toStable
 }
 
@@ -216,7 +222,7 @@ func (l *RaftLog) truncateEntries(index uint64) {
 		return
 	}
 	if index < l.LastIndex() {
-		l.entries = l.entries[:index+1]
+		l.entries = l.entries[:l.relativeIndex(index)+1]
 		if l.stabled > index {
 			l.stabled = index
 		}
@@ -225,7 +231,7 @@ func (l *RaftLog) truncateEntries(index uint64) {
 
 func (l *RaftLog) findConflict(entries []*pb.Entry) uint64 {
 	for _, entry := range entries {
-		if l.LastIndex() < entry.Index || l.entries[entry.Index].Term != entry.Term {
+		if l.LastIndex() < entry.Index || l.entries[l.relativeIndex(entry.Index)].Term != entry.Term {
 			return entry.Index
 		}
 	}
@@ -272,7 +278,7 @@ func (l *RaftLog) append(entries ...*pb.Entry) {
 
 func (l *RaftLog) hastNextCommittedEntries() bool {
 	start := l.applied + 1
-	end := min(l.committed, l.stabled) + 1
+	end := l.committed + 1
 	return start < end
 }
 
@@ -282,5 +288,5 @@ func (l *RaftLog) nextCommittedEntries() []pb.Entry {
 	if start >= end {
 		return []pb.Entry{}
 	}
-	return l.entries[start:end]
+	return l.entries[l.relativeIndex(start):l.relativeIndex(end)]
 }

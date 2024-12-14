@@ -16,7 +16,7 @@ package raft
 
 import (
 	"errors"
-
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -175,6 +175,7 @@ func (rn *RawNode) Ready() Ready {
 	}
 	rd.Entries = rn.Raft.RaftLog.unstableEntries()
 	rd.CommittedEntries = rn.Raft.RaftLog.nextCommittedEntries()
+	log.RaftLog(log.DPersist, "S%d stable %d, applied %d, lastIndex %d committed %d", rn.Raft.id, rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.committed)
 	return rd
 }
 

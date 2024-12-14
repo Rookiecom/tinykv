@@ -3,6 +3,7 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -17,6 +18,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
 	"github.com/pingcap/errors"
@@ -308,6 +310,18 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if entries == nil || len(entries) == 0 {
+		return nil
+	}
+	for _, entry := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+	ps.raftState.LastIndex = entries[len(entries)-1].Index
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	if err := ps.Engines.WriteRaft(raftWB); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -331,6 +345,24 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	wb := new(engine_util.WriteBatch)
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+	if err := ps.Append(ready.Entries, wb); err != nil {
+		return nil, err
+	}
+	wb.Reset()
+	ps.applyState.AppliedIndex = max(ps.applyState.AppliedIndex, ready.LastCommittedIndex())
+	if ps.applyState.AppliedIndex > ps.raftState.LastIndex {
+		log.Fatalf("%s unexpected applied index, %v, %v, ready %+v, entry %v commitentry %v", ps.Tag, ps.applyState, ps.raftState, ready, ready.Entries, ready.CommittedEntries)
+	}
+	wb.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	wb.SetMeta(meta.RegionStateKey(ps.region.Id), &rspb.RegionLocalState{
+		State:  rspb.PeerState_Normal,
+		Region: ps.region,
+	})
+	ps.Engines.WriteKV(wb)
 	return nil, nil
 }
 
@@ -344,4 +376,72 @@ func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 		StartKey: start,
 		EndKey:   end,
 	}
+}
+
+func (ps *PeerStorage) leaderHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest, cb *message.Callback) (cmdResp *raft_cmdpb.RaftCmdResponse, err error) {
+	txn := ps.Engines.Kv.NewTransaction(true)
+	defer txn.Discard()
+	cmdResp = &raft_cmdpb.RaftCmdResponse{}
+	for _, req := range cmdReq.Requests {
+		resp := new(raft_cmdpb.Response)
+		item := new(badger.Item)
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			resp.Get = new(raft_cmdpb.GetResponse)
+			if item, err = txn.Get(engine_util.KeyWithCF(req.Get.Cf, req.Get.Key)); err != nil {
+				return
+			}
+			if item == nil {
+				err = badger.ErrKeyNotFound
+				return
+			}
+			if resp.Get.Value, err = item.Value(); err != nil {
+				return
+			}
+			resp.CmdType = raft_cmdpb.CmdType_Get
+		case raft_cmdpb.CmdType_Put:
+			if err = txn.Set(engine_util.KeyWithCF(req.Put.Cf, req.Put.Key), req.Put.Value); err != nil {
+				return
+			}
+			resp.CmdType = raft_cmdpb.CmdType_Put
+		case raft_cmdpb.CmdType_Delete:
+			if err = txn.Delete(engine_util.KeyWithCF(req.Delete.Cf, req.Delete.Key)); err != nil {
+				return
+			}
+			resp.CmdType = raft_cmdpb.CmdType_Delete
+		case raft_cmdpb.CmdType_Snap:
+			resp.Snap = new(raft_cmdpb.SnapResponse)
+			resp.Snap.Region = ps.region
+			resp.CmdType = raft_cmdpb.CmdType_Snap
+			cb.Txn = txn
+		case raft_cmdpb.CmdType_Invalid:
+		}
+		cmdResp.Responses = append(cmdResp.Responses, resp)
+	}
+	err = txn.Commit()
+	return
+}
+
+func (ps *PeerStorage) followerHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest) {
+	txn := ps.Engines.Kv.NewTransaction(true)
+	defer txn.Discard()
+	for _, req := range cmdReq.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			break
+		case raft_cmdpb.CmdType_Put:
+			if err := txn.Set(engine_util.KeyWithCF(req.Put.Cf, req.Put.Key), req.Put.Value); err != nil {
+				return
+			}
+		case raft_cmdpb.CmdType_Delete:
+			if err := txn.Delete(engine_util.KeyWithCF(req.Delete.Cf, req.Delete.Key)); err != nil {
+				return
+			}
+		case raft_cmdpb.CmdType_Snap:
+			break
+		case raft_cmdpb.CmdType_Invalid:
+		}
+	}
+	txn.Commit()
+	return
 }

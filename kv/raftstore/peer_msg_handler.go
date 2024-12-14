@@ -2,6 +2,8 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/golang/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -43,6 +45,24 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	rd := d.RaftGroup.Ready()
+	if len(rd.CommittedEntries) > 0 {
+		log.Debugf("%s commit to %d", d.Tag, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
+	}
+	if len(rd.Entries) > 0 {
+		log.Debugf("%s stable to %d", d.Tag, rd.Entries[len(rd.Entries)-1].Index)
+	}
+	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		log.Debugf("%s save ready state failed %v", d.Tag, err)
+	}
+	for _, cmsg := range rd.CommittedEntries {
+		d.applyProposal(&cmsg)
+	}
+	d.Send(d.ctx.trans, rd.Messages)
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +134,63 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	r := d.RaftGroup
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	nextProposals := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	if err = r.Propose(data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	d.proposals = append(d.proposals, nextProposals)
+	log.Debugf("%s propose raft command %s", d.Tag, msg)
+}
+
+func (d *peerMsgHandler) applyProposal(msg *eraftpb.Entry) {
+	if msg.EntryType == eraftpb.EntryType_EntryConfChange {
+		return
+	}
+	cmdReq := new(raft_cmdpb.RaftCmdRequest)
+	if err := proto.Unmarshal(msg.Data, cmdReq); err != nil {
+		log.Debugf("%s unmarshal data failed %v", d.Tag, err)
+		return
+	}
+	if cmdReq.Header == nil || cmdReq.Header.Peer == nil || cmdReq.Header.Peer.Id == 0 {
+		// dummy log, skip
+		return
+	}
+	if cmdReq.Header.Peer.Id != d.PeerId() {
+		d.peerStorage.followerHandleRaftCmdReq(cmdReq)
+		return
+	}
+	log.Debugf("%s apply proposal %s, proposals %+v", d.Tag, cmdReq.Requests, d.proposals)
+	for len(d.proposals) != 0 {
+		p := d.proposals[0]
+		if p.term < msg.Term || p.index < msg.Index {
+			p.cb.Done(ErrRespStaleCommand(msg.Term))
+			d.proposals = d.proposals[1:]
+			continue
+		}
+		if p.term > msg.Term || p.index > msg.Index {
+			break
+		}
+		if cmdResp, err := d.peerStorage.leaderHandleRaftCmdReq(cmdReq, p.cb); err != nil {
+			p.cb.Done(ErrResp(err))
+		} else {
+			log.Debugf("%s apply proposal %s success", d.Tag, cmdReq.Requests)
+			BindRespTerm(cmdResp, msg.Term)
+			p.cb.Done(cmdResp)
+		}
+		d.proposals = d.proposals[1:]
+		break
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +300,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
