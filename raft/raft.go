@@ -210,7 +210,8 @@ func newRaft(c *Config) *Raft {
 	}
 	r.Term = hardState.GetTerm()
 	r.Vote = hardState.GetVote()
-	r.RaftLog.committed = hardState.GetCommit()
+	r.RaftLog.commitTo(hardState.GetCommit())
+	r.RaftLog.applyTo(c.Applied)
 	r.resetRandomElectionTimeout()
 	if len(c.peers) != 0 {
 		for _, id := range c.peers {

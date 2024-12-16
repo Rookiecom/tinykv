@@ -380,7 +380,6 @@ func (ps *PeerStorage) clearRange(regionID uint64, start, end []byte) {
 
 func (ps *PeerStorage) leaderHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest, cb *message.Callback) (cmdResp *raft_cmdpb.RaftCmdResponse, err error) {
 	txn := ps.Engines.Kv.NewTransaction(true)
-	defer txn.Discard()
 	cmdResp = &raft_cmdpb.RaftCmdResponse{}
 	for _, req := range cmdReq.Requests {
 		resp := new(raft_cmdpb.Response)
@@ -389,10 +388,12 @@ func (ps *PeerStorage) leaderHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest,
 		case raft_cmdpb.CmdType_Get:
 			resp.Get = new(raft_cmdpb.GetResponse)
 			if item, err = txn.Get(engine_util.KeyWithCF(req.Get.Cf, req.Get.Key)); err != nil {
+				txn.Discard()
 				return
 			}
 			if item == nil {
 				err = badger.ErrKeyNotFound
+				txn.Discard()
 				return
 			}
 			if resp.Get.Value, err = item.Value(); err != nil {
@@ -401,11 +402,13 @@ func (ps *PeerStorage) leaderHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest,
 			resp.CmdType = raft_cmdpb.CmdType_Get
 		case raft_cmdpb.CmdType_Put:
 			if err = txn.Set(engine_util.KeyWithCF(req.Put.Cf, req.Put.Key), req.Put.Value); err != nil {
+				txn.Discard()
 				return
 			}
 			resp.CmdType = raft_cmdpb.CmdType_Put
 		case raft_cmdpb.CmdType_Delete:
 			if err = txn.Delete(engine_util.KeyWithCF(req.Delete.Cf, req.Delete.Key)); err != nil {
+				txn.Discard()
 				return
 			}
 			resp.CmdType = raft_cmdpb.CmdType_Delete
@@ -424,17 +427,18 @@ func (ps *PeerStorage) leaderHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest,
 
 func (ps *PeerStorage) followerHandleRaftCmdReq(cmdReq *raft_cmdpb.RaftCmdRequest) {
 	txn := ps.Engines.Kv.NewTransaction(true)
-	defer txn.Discard()
 	for _, req := range cmdReq.Requests {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Get:
 			break
 		case raft_cmdpb.CmdType_Put:
 			if err := txn.Set(engine_util.KeyWithCF(req.Put.Cf, req.Put.Key), req.Put.Value); err != nil {
+				txn.Discard()
 				return
 			}
 		case raft_cmdpb.CmdType_Delete:
 			if err := txn.Delete(engine_util.KeyWithCF(req.Delete.Cf, req.Delete.Key)); err != nil {
+				txn.Discard()
 				return
 			}
 		case raft_cmdpb.CmdType_Snap:
