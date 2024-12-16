@@ -66,7 +66,7 @@ func (pst processStateType) String() string {
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
 
-const maxSendMsgCount = 10
+const maxSendMsgCount = 100
 
 // Config contains the parameters to start a raft.
 type Config struct {
@@ -126,10 +126,17 @@ func (c *Config) validate() error {
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
-	Match, Next    uint64
-	state          processStateType
-	inflightIndex  uint64
-	inflightCommit uint64
+	Match, Next     uint64
+	state           processStateType
+	inflightIndex   uint64
+	inflightCommit  uint64
+	snapshotSending bool
+}
+
+func (pr *Progress) reset() {
+	pr.inflightIndex = 0
+	pr.inflightCommit = 0
+	pr.snapshotSending = false
 }
 
 type Raft struct {
@@ -257,16 +264,20 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Commit:  r.RaftLog.committed,
 	}
 	next := pr.Next
-	term, err := r.RaftLog.Term(next - 1)
-	if err != nil {
-		return false
+	if next < r.RaftLog.FirstIndex() {
+		pr.state = processStateSnapshot
 	}
-	msg.LogTerm = term
-	msg.Index = next - 1
+	if pr.state != processStateSnapshot {
+		term, err := r.RaftLog.Term(next - 1)
+		if err != nil {
+			return false
+		}
+		msg.LogTerm = term
+		msg.Index = next - 1
+	}
 	switch r.Prs[to].state {
 	case processStateProbe:
-		var entries []pb.Entry
-		entries, err = r.RaftLog.Entries(next, next+1)
+		entries, err := r.RaftLog.Entries(next, next+1)
 		if err != nil {
 			return false
 		}
@@ -277,8 +288,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			return false
 		}
 		pr.inflightCommit = r.RaftLog.committed
-		var entries []pb.Entry
-		entries, err = r.RaftLog.Entries(next, min(r.RaftLog.LastIndex()+1, next+maxSendMsgCount))
+		entries, err := r.RaftLog.Entries(next, min(r.RaftLog.LastIndex()+1, next+maxSendMsgCount))
 		if err != nil {
 			return false
 		}
@@ -288,6 +298,17 @@ func (r *Raft) sendAppend(to uint64) bool {
 		msg.Entries = tranEntries(entries)
 		break
 	case processStateSnapshot:
+		if pr.snapshotSending {
+			return false
+		}
+		msg.MsgType = pb.MessageType_MsgSnapshot
+		snap, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			return false
+		}
+		log.RaftLog(log.DSnap, "S%d send snapshot to S%d, index %d, term %d", r.id, to, snap.Metadata.Index, snap.Metadata.Term)
+		msg.Snapshot = &snap
+		pr.snapshotSending = true
 		break
 	}
 	log.RaftLog(log.DLog, "S%d send append to S%d(%s), index %d, term %d, commit %d", r.id, to, pr.state.String(), msg.Index, msg.LogTerm, msg.Commit)
@@ -397,7 +418,7 @@ func (r *Raft) Step(m pb.Message) error {
 	case r.Term > m.Term:
 		if m.MsgType == pb.MessageType_MsgRequestVote {
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Term: r.Term, Reject: true})
-		} else if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend {
+		} else if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
 			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, To: m.From, Term: r.Term, Reject: true})
 		}
 		return nil
@@ -512,6 +533,9 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			} else {
 				return
 			}
+			if pr.Next < r.RaftLog.FirstIndex() {
+				pr.state = processStateSnapshot
+			}
 		} else {
 			pr.Match = pr.Next
 			pr.Next++
@@ -522,13 +546,25 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			pr.inflightIndex = 0
 			pr.inflightCommit = 0
 			pr.Next--
-			pr.state = processStateProbe
+			if pr.Next < r.RaftLog.FirstIndex() {
+				pr.state = processStateSnapshot
+			} else {
+				pr.state = processStateProbe
+			}
 		} else {
 			pr.Next = m.Index + 1
 			pr.Match = m.Index
 			pr.inflightIndex = max(pr.inflightIndex, m.Index)
 		}
 	case processStateSnapshot:
+		if m.Reject {
+			log.RaftLog(log.DSnap, "S%d receive reject from S%d, index %d, term %d", r.id, m.From, m.Index, m.LogTerm)
+			return
+		}
+		pr.Match = m.Index
+		pr.Next = m.Index + 1
+		pr.state = processStateProbe
+		pr.snapshotSending = false
 	default:
 	}
 	r.refreshCommit()
@@ -634,6 +670,22 @@ func (r *Raft) checkCandidate(term uint64) bool {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	msg := pb.Message{MsgType: pb.MessageType_MsgAppendResponse, From: r.id, To: m.From, Term: r.Term, Index: r.RaftLog.LastIndex()}
+	if m.Snapshot.Metadata.Index <= r.RaftLog.committed {
+		msg.Reject = true
+		r.msgs = append(r.msgs, msg)
+		log.RaftLog(log.DSnap, "S%d(commit %d) reject snapshot from S%d, index %d, term %d", r.id, r.RaftLog.committed, m.From, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term)
+		return
+	}
+	r.Prs = make(map[uint64]*Progress)
+	r.votes = make(map[uint64]bool)
+	for _, id := range m.Snapshot.Metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
+		r.votes[id] = false
+	}
+	r.RaftLog.receiveSnapshot(m.Snapshot)
+	log.RaftLog(log.DSnap, "S%d receive snapshot from S%d, index %d, term %d", r.id, m.From, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term)
+	r.msgs = append(r.msgs, msg)
 }
 
 // addNode add a new node to raft group
@@ -669,7 +721,7 @@ func (r *Raft) followerStep(m *pb.Message) error {
 	case pb.MessageType_MsgRequestVoteResponse:
 		return ErrProposalDropped
 	case pb.MessageType_MsgSnapshot:
-		// TODO handle snapshot
+		r.handleSnapshot(*m)
 		break
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(*m)
@@ -708,7 +760,7 @@ func (r *Raft) candidateStep(m *pb.Message) error {
 			r.becomeFollower(m.Term, None)
 		}
 	case pb.MessageType_MsgSnapshot:
-		// TODO handle snapshot
+		r.handleSnapshot(*m)
 		break
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(*m)
@@ -747,7 +799,6 @@ func (r *Raft) leaderStep(m *pb.Message) error {
 	case pb.MessageType_MsgRequestVoteResponse:
 		break
 	case pb.MessageType_MsgSnapshot:
-		// TODO handle snapshot
 		break
 	case pb.MessageType_MsgHeartbeat:
 		break
@@ -755,8 +806,7 @@ func (r *Raft) leaderStep(m *pb.Message) error {
 		pr := r.Prs[m.From]
 		if pr.Match < r.RaftLog.LastIndex() {
 			// maybe the follower is down
-			pr.inflightIndex = 0
-			pr.inflightCommit = 0
+			pr.reset()
 			r.sendAppend(m.From)
 		}
 		r.sendAppend(m.From)

@@ -49,15 +49,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	rd := d.RaftGroup.Ready()
-	if len(rd.CommittedEntries) > 0 {
-		log.Debugf("%s commit to %d", d.Tag, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
-	}
-	if len(rd.Entries) > 0 {
-		log.Debugf("%s stable to %d", d.Tag, rd.Entries[len(rd.Entries)-1].Index)
-	}
-	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
-		log.Debugf("%s save ready state failed %v", d.Tag, err)
-	}
+	d.peerStorage.SaveReadyState(&rd)
 	for _, cmsg := range rd.CommittedEntries {
 		d.applyProposal(&cmsg)
 	}
@@ -137,7 +129,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	r := d.RaftGroup
 	data, err := proto.Marshal(msg)
 	if err != nil {
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		return
 	}
 	nextProposals := &proposal{
@@ -146,7 +140,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb:    cb,
 	}
 	if err = r.Propose(data); err != nil {
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		return
 	}
 	d.proposals = append(d.proposals, nextProposals)
@@ -166,11 +162,24 @@ func (d *peerMsgHandler) applyProposal(msg *eraftpb.Entry) {
 		// dummy log, skip
 		return
 	}
+	if cmdReq.AdminRequest != nil {
+		// compact log command
+		d.peerStorage.handleLogCompact(cmdReq)
+		d.ScheduleCompactLog(cmdReq.AdminRequest.CompactLog.CompactIndex)
+		return
+	}
+	switch cmdReq.Requests[0].CmdType {
+	case raft_cmdpb.CmdType_Get:
+	case raft_cmdpb.CmdType_Put:
+		log.RaftLog(log.DClient, "S%d apply %s %s %s", d.Meta.StoreId, cmdReq.Requests[0].CmdType.String(), string(cmdReq.Requests[0].Put.Key), string(cmdReq.Requests[0].Put.Value))
+	case raft_cmdpb.CmdType_Delete:
+		log.RaftLog(log.DClient, "S%d apply %s %s", d.Meta.StoreId, cmdReq.Requests[0].CmdType.String(), string(cmdReq.Requests[0].Delete.Key))
+	case raft_cmdpb.CmdType_Snap:
+	}
 	if cmdReq.Header.Peer.Id != d.PeerId() {
 		d.peerStorage.followerHandleRaftCmdReq(cmdReq)
 		return
 	}
-	log.Debugf("%s apply proposal %s, proposals %+v", d.Tag, cmdReq.Requests, d.proposals)
 	for len(d.proposals) != 0 {
 		p := d.proposals[0]
 		if p.term < msg.Term || p.index < msg.Index {

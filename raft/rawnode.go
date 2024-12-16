@@ -173,6 +173,10 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(rn.prevHardSt, rn.Raft.hardState()) {
 		rd.HardState = rn.Raft.hardState()
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		log.RaftLog(log.DSnap, "S%d pendingSnapshot index %d", rn.Raft.id, rn.Raft.RaftLog.pendingSnapshot.Metadata.Index)
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	rd.Entries = rn.Raft.RaftLog.unstableEntries()
 	rd.CommittedEntries = rn.Raft.RaftLog.nextCommittedEntries()
 	log.RaftLog(log.DPersist, "S%d stable %d, applied %d, lastIndex %d committed %d", rn.Raft.id, rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.committed)
@@ -214,7 +218,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applyTo(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
 	}
+	rn.Raft.RaftLog.clearPendingSnapshot()
 	rn.Raft.msgs = nil
+	rn.Raft.RaftLog.maybeCompact()
 }
 
 // GetProgress return the Progress of this node and its peers, if this

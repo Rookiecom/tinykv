@@ -54,7 +54,6 @@ type RaftLog struct {
 
 	// Your Data Here (2A).
 	// firstIndex is the index of the first entry in entries include dummy entry
-	// also mean snapshot log length
 	firstIndex uint64
 }
 
@@ -83,7 +82,6 @@ func newLog(storage Storage) *RaftLog {
 	l.stabled = lastIndex
 
 	l.firstIndex = firstIndex - 1
-
 	return l
 }
 
@@ -92,6 +90,12 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	first, _ := l.storage.FirstIndex()
+	if first > l.FirstIndex() {
+		l.entries = l.entries[l.relativeIndex(first-1):]
+		// first - 1 mean the truncate index
+		l.firstIndex = first - 1
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -289,4 +293,21 @@ func (l *RaftLog) nextCommittedEntries() []pb.Entry {
 		return []pb.Entry{}
 	}
 	return l.entries[l.relativeIndex(start):l.relativeIndex(end)]
+}
+
+func (l *RaftLog) receiveSnapshot(snapshot *pb.Snapshot) {
+	l.pendingSnapshot = snapshot
+	l.stabled = snapshot.Metadata.Index
+	l.firstIndex = snapshot.Metadata.Index
+	l.entries = []pb.Entry{{Index: snapshot.Metadata.Index, Term: snapshot.Metadata.Term}}
+	l.committed = snapshot.Metadata.Index
+	l.applied = snapshot.Metadata.Index
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil
+}
+
+func (l *RaftLog) clearPendingSnapshot() {
+	l.pendingSnapshot = nil
 }
