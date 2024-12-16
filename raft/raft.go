@@ -62,6 +62,14 @@ func (pst processStateType) String() string {
 	return pstmap[uint64(pst)]
 }
 
+type transferStateType uint64
+
+const (
+	transferStateNone transferStateType = iota
+	transferStateWait
+	transferStateSending
+)
+
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
@@ -183,6 +191,7 @@ type Raft struct {
 	// (Used in 3A leader transfer)
 	leadTransferee uint64
 
+	transferState transferStateType
 	// Only one conf change may be pending (in the log, but not yet
 	// applied) at a time. This is enforced via PendingConfIndex, which
 	// is set to a value >= the log index of the latest pending
@@ -334,9 +343,18 @@ func (r *Raft) tick() {
 		}
 	case StateLeader:
 		r.heartbeatElapsed++
+		if r.transferState == transferStateSending {
+			r.electionElapsed++
+		}
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+		}
+		if r.electionElapsed >= r.electionTimeout {
+			// fail to transfer leader
+			r.electionElapsed = 0
+			r.transferState = transferStateNone
+			r.leadTransferee = 0
 		}
 	}
 }
@@ -352,6 +370,9 @@ func (r *Raft) reset(term uint64) {
 
 	// reset vote
 	r.votes = map[uint64]bool{}
+	// reset transfer info
+	r.transferState = transferStateNone
+	r.leadTransferee = 0
 }
 
 func (r *Raft) resetRandomElectionTimeout() {
@@ -552,8 +573,8 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 				pr.state = processStateProbe
 			}
 		} else {
-			pr.Next = m.Index + 1
-			pr.Match = m.Index
+			pr.Match = max(pr.Match, m.Index)
+			pr.Next = pr.Match + 1
 			pr.inflightIndex = max(pr.inflightIndex, m.Index)
 		}
 	case processStateSnapshot:
@@ -568,11 +589,27 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	default:
 	}
 	r.refreshCommit()
+	r.checkTransfer(m.From)
 	r.sendAppend(m.From)
 
 }
 
+func (r *Raft) checkTransfer(id uint64) {
+	if id != r.leadTransferee {
+		return
+	}
+	pr := r.Prs[id]
+	if pr.Match != r.RaftLog.LastIndex() {
+		return
+	}
+	r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: id, Term: r.Term})
+	r.transferState = transferStateSending
+}
+
 func (r *Raft) refreshCommit() {
+	if len(r.Prs) == 0 {
+		return
+	}
 	matchArray := make([]uint64, 0)
 	for id, process := range r.Prs {
 		if id == r.id {
@@ -584,7 +621,9 @@ func (r *Raft) refreshCommit() {
 		return matchArray[i] > matchArray[j]
 	})
 	var halfMatch uint64
-	if len(matchArray)%2 == 0 {
+	if len(r.Prs) == 1 {
+		halfMatch = r.RaftLog.LastIndex()
+	} else if len(matchArray)%2 == 0 {
 		halfMatch = matchArray[len(matchArray)/2-1]
 	} else {
 		halfMatch = matchArray[len(matchArray)/2]
@@ -691,11 +730,27 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		return
+	}
+	pr := &Progress{}
+	if r.State == StateLeader {
+		// TODO comfirm the setting
+		pr.state = processStateReplicate
+		pr.Match = r.RaftLog.LastIndex() - 1
+		pr.Next = r.RaftLog.LastIndex()
+	}
+	r.Prs[id] = pr
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		return
+	}
+	delete(r.Prs, id)
+	r.refreshCommit()
 }
 
 func (r *Raft) followerStep(m *pb.Message) error {
@@ -722,16 +777,22 @@ func (r *Raft) followerStep(m *pb.Message) error {
 		return ErrProposalDropped
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(*m)
-		break
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(*m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		return ErrProposalDropped
 	case pb.MessageType_MsgTransferLeader:
-		// TODO handle transfer leader
-		break
+		m.From = m.To
+		m.To = r.Lead
+		r.msgs = append(r.msgs, *m)
 	case pb.MessageType_MsgTimeoutNow:
-		break
+		if len(r.Prs) == 0 {
+			return ErrProposalDropped
+		}
+		if _, ok := r.Prs[m.To]; !ok {
+			return ErrProposalDropped
+		}
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 	}
 	return nil
 }
@@ -744,7 +805,6 @@ func (r *Raft) candidateStep(m *pb.Message) error {
 	case pb.MessageType_MsgBeat:
 		return ErrProposalDropped
 	case pb.MessageType_MsgPropose:
-		break
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(*m)
@@ -752,7 +812,6 @@ func (r *Raft) candidateStep(m *pb.Message) error {
 		return ErrProposalDropped
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(*m)
-		break
 	case pb.MessageType_MsgRequestVoteResponse:
 		if r.checkCandidate(m.Term) {
 			r.handleRequestVoteResponse(*m)
@@ -761,16 +820,12 @@ func (r *Raft) candidateStep(m *pb.Message) error {
 		}
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(*m)
-		break
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(*m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		return ErrProposalDropped
 	case pb.MessageType_MsgTransferLeader:
-		// TODO handle transfer leader
-		break
 	case pb.MessageType_MsgTimeoutNow:
-		break
 	}
 	return nil
 }
@@ -782,7 +837,9 @@ func (r *Raft) leaderStep(m *pb.Message) error {
 	case pb.MessageType_MsgBeat:
 		r.broadcastHeartbeat()
 	case pb.MessageType_MsgPropose:
-		log.RaftLog(log.DLeader, "S%d receive propose", r.id)
+		if r.transferState != transferStateNone {
+			return ErrProposalDropped
+		}
 		r.appendEntries(m)
 		if len(r.Prs) == 1 {
 			r.commitTo(r.RaftLog.LastIndex())
@@ -795,13 +852,9 @@ func (r *Raft) leaderStep(m *pb.Message) error {
 
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(*m)
-		break
 	case pb.MessageType_MsgRequestVoteResponse:
-		break
 	case pb.MessageType_MsgSnapshot:
-		break
 	case pb.MessageType_MsgHeartbeat:
-		break
 	case pb.MessageType_MsgHeartbeatResponse:
 		pr := r.Prs[m.From]
 		if pr.Match < r.RaftLog.LastIndex() {
@@ -810,12 +863,21 @@ func (r *Raft) leaderStep(m *pb.Message) error {
 			r.sendAppend(m.From)
 		}
 		r.sendAppend(m.From)
-		break
 	case pb.MessageType_MsgTransferLeader:
-		// TODO hankdle transfer leader
-		break
+		from := m.From
+		if r.Prs[from] == nil {
+			return nil
+		}
+		r.leadTransferee = from
+		if r.Prs[from].Match == r.RaftLog.LastIndex() {
+			r.transferState = transferStateSending
+			r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: from, Term: r.Term})
+		} else {
+			r.transferState = transferStateWait
+			r.Prs[from].reset()
+			r.sendAppend(from)
+		}
 	case pb.MessageType_MsgTimeoutNow:
-		break
 	}
 	return nil
 }
